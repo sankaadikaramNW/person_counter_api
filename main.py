@@ -20,7 +20,8 @@ DATABASE_URL = "postgresql://personuser:4zbHpRhdJtdZKmQCNv6AUouMGuwUg9Oq@dpg-d69
 engine = create_engine(
     DATABASE_URL,
     pool_pre_ping=True,
-    pool_recycle=300
+    pool_recycle=300,
+    connect_args={"sslmode": "require"}
 )
 SessionLocal = sessionmaker(bind=engine)
 Base = declarative_base()
@@ -28,6 +29,12 @@ Base = declarative_base()
 # ================= APP =================
 
 app = FastAPI()
+
+@app.get("/")
+def root():
+    return {"status": "Person Counter API is running"}
+
+
 
 # Allow external devices (NodeMCU from any network)
 app.add_middleware(
