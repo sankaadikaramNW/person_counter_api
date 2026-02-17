@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from datetime import datetime, timedelta
@@ -6,16 +6,16 @@ import pytz
 import asyncio
 
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, desc
-from sqlalchemy.orm import declarative_base, sessionmaker
+from sqlalchemy.orm import declarative_base, sessionmaker, Session
 
+# ================= SYSTEM CONFIG =================
 
-# ===== SYSTEM CONFIGURATION =====
-OFFLINE_TIMEOUT = 8   # seconds → if no data received within 8s, mark sensor offline
-
-# ================= DATABASE =================
+OFFLINE_TIMEOUT = 8  # seconds
+SL_TZ = pytz.timezone("Asia/Colombo")
 
 DATABASE_URL = "postgresql://personuser:4zbHpRhdJtdZKmQCNv6AUouMGuwUg9Oq@dpg-d69nac3nv86c73f2hdcg-a.singapore-postgres.render.com/personcounter"
 
+# ================= DATABASE =================
 
 engine = create_engine(
     DATABASE_URL,
@@ -23,20 +23,39 @@ engine = create_engine(
     pool_recycle=300,
     connect_args={"sslmode": "require"}
 )
+
 SessionLocal = sessionmaker(bind=engine)
 Base = declarative_base()
+
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+# ================= MODELS =================
+
+class PersonCount(Base):
+    __tablename__ = "person_counts"
+
+    id = Column(Integer, primary_key=True, index=True)
+    sensor_id = Column(String, index=True)
+    batch = Column(Integer)
+    total = Column(Integer)
+    timestamp = Column(DateTime(timezone=True))
+    last_seen = Column(DateTime(timezone=True))
+    status = Column(String)
+
+
+Base.metadata.create_all(bind=engine)
 
 # ================= APP =================
 
 app = FastAPI()
 
-@app.get("/")
-def root():
-    return {"status": "Person Counter API is running"}
-
-
-
-# Allow external devices (NodeMCU from any network)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -45,22 +64,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-SL_TZ = pytz.timezone("Asia/Colombo")
 
-# ================= MODEL =================
+@app.get("/")
+def root():
+    return {"status": "Person Counter API is running"}
 
-class PersonCount(Base):
-    __tablename__ = "person_counts"
-
-    id = Column(Integer, primary_key=True, index=True)
-    sensor_id = Column(String)
-    batch = Column(Integer)
-    total = Column(Integer)
-    timestamp = Column(DateTime(timezone=True))
-    status = Column(String)
-    last_seen = Column(DateTime(timezone=True))
-
-Base.metadata.create_all(bind=engine)
 
 # ================= REQUEST MODEL =================
 
@@ -69,71 +77,67 @@ class PersonData(BaseModel):
     batch: int
     total: int
 
-# ================= RECEIVE DATA =================
+
+# ================= RECEIVE PERSON COUNT =================
 
 @app.post("/api/person-count")
-def receive_data(data: PersonData):
-    db = SessionLocal()
+def person_count(data: PersonData, db: Session = Depends(get_db)):
 
-    try:
-        now_sl = datetime.now(SL_TZ)
+    now_sl = datetime.now(SL_TZ)
 
-        record = PersonCount(
-            sensor_id=data.sensor_id,
-            batch=data.batch,
-            total=data.total,
-            timestamp=now_sl,
-            status="ONLINE",
-            last_seen=now_sl
-        )
+    new_record = PersonCount(
+        sensor_id=data.sensor_id,
+        batch=data.batch,
+        total=data.total,
+        timestamp=now_sl,
+        last_seen=now_sl,
+        status="ONLINE"
+    )
 
-        db.add(record)
-        db.commit()
+    db.add(new_record)
+    db.commit()
 
-        return {"message": "stored"}
+    return {"message": "Count stored successfully"}
 
-    finally:
-        db.close()
 
 # ================= SENSOR STATUS =================
 
 @app.get("/api/sensor-status")
-def get_sensor_status():
-    db = SessionLocal()
+def get_sensor_status(db: Session = Depends(get_db)):
 
-    try:
-        sensors = db.query(PersonCount.sensor_id).distinct().all()
-        result = []
+    sensors = db.query(PersonCount.sensor_id).distinct().all()
+    result = []
 
-        for (sensor_id,) in sensors:
-            latest = (
-                db.query(PersonCount)
-                .filter(PersonCount.sensor_id == sensor_id)
-                .order_by(desc(PersonCount.timestamp))
-                .first()
-            )
+    for (sensor_id,) in sensors:
 
-            if latest:
-                result.append({
-                    "sensor_id": sensor_id,
-                    "status": latest.status,
-                    "last_seen": latest.last_seen.isoformat(),
-                    "batch": latest.batch,
-                    "total": latest.total
-                })
+        latest = (
+            db.query(PersonCount)
+            .filter(PersonCount.sensor_id == sensor_id)
+            .order_by(desc(PersonCount.timestamp))
+            .first()
+        )
 
-        return result
+        if latest:
+            result.append({
+                "sensor_id": sensor_id,
+                "status": latest.status,
+                "last_seen": latest.last_seen.isoformat(),
+                "timestamp": latest.timestamp.isoformat(),
+                "batch": latest.batch,
+                "total": latest.total
+            })
 
-    finally:
-        db.close()
+    return result
+
 
 # ================= AUTO OFFLINE DETECTION =================
 
 async def check_offline_sensors():
     while True:
-        await asyncio.sleep(10)
+        await asyncio.sleep(5)
 
         db = SessionLocal()
+
         try:
             now_sl = datetime.now(SL_TZ)
             timeout = now_sl - timedelta(seconds=OFFLINE_TIMEOUT)
@@ -149,13 +153,11 @@ async def check_offline_sensors():
                     .first()
                 )
 
-                # ✅ IMPORTANT SAFETY CHECK
-                if latest and latest.last_seen is not None:
+                if latest and latest.last_seen:
 
-                    if latest.last_seen < timeout:
-                        if latest.status != "OFFLINE":
-                            latest.status = "OFFLINE"
-                            print(f"{sensor_id} marked OFFLINE")
+                    if latest.last_seen < timeout and latest.status != "OFFLINE":
+                        latest.status = "OFFLINE"
+                        print(f"{sensor_id} marked OFFLINE")
 
             db.commit()
 
@@ -164,8 +166,6 @@ async def check_offline_sensors():
 
         finally:
             db.close()
-
-
 
 
 @app.on_event("startup")
